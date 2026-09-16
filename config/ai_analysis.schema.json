@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "likely_causes", "suggestions", "evidence_sufficient", "allow_retry", "retry_reason", "risk"],
+  "properties": {
+    "summary": {"type": "string"},
+    "likely_causes": {"type": "array", "items": {"type": "string"}},
+    "suggestions": {"type": "array", "items": {"type": "string"}},
+    "evidence_sufficient": {"type": "boolean"},
+    "allow_retry": {"type": "boolean"},
+    "retry_reason": {"type": "string"},
+    "risk": {"type": "string"}
+  }
+}
