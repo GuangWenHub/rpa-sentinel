@@ -32,6 +32,7 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     scan = sub.add_parser("scan"); scan.add_argument("--force", action="store_true"); scan.add_argument("--no-ai", action="store_true")
     sub.add_parser("settings-get")
+    sub.add_parser("status")
     save = sub.add_parser("settings-save"); save.add_argument("json")
     data = sub.add_parser("data"); data.add_argument("--view", choices=("attention", "errors", "all", "recycle"), default="attention")
     ai = sub.add_parser("analyze"); ai.add_argument("--job", required=True)
@@ -45,6 +46,8 @@ def main(argv=None) -> int:
     try:
         if args.command == "scan": _print(run_scan(args.force, not args.no_ai))
         elif args.command == "settings-get": _print(load_settings())
+        elif args.command == "status":
+            _print({"state": read_json("monitor_state.json", {}), "status": read_json("monitor_status.json", {})})
         elif args.command == "settings-save": save_settings(json.loads(args.json)); _print(load_settings())
         elif args.command == "data":
             housekeeping()

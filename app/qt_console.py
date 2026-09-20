@@ -94,6 +94,34 @@ def text(value) -> str:
     return "" if value is None else str(value)
 
 
+def parse_local_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(text(value).replace("Z", "+00:00"))
+        return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def calculate_next_due(now: datetime, settings: dict) -> datetime | None:
+    if settings.get("paused"):
+        return None
+    try:
+        start_h, start_m = map(int, settings.get("start_time", "08:00").split(":"))
+        end_h, end_m = map(int, settings.get("end_time", "17:30").split(":"))
+        start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+        frequency = max(1, int(settings.get("frequency_minutes", 10)))
+        if now < start:
+            return start
+        if now > end:
+            return start + timedelta(days=1)
+        steps = int((now - start).total_seconds() // (frequency * 60)) + 1
+        due = start + timedelta(minutes=steps * frequency)
+        return due if due <= end else start + timedelta(days=1)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def display_row(record: dict, wrapped: bool) -> dict:
     job = record.get("job", {}) if wrapped else record
     analysis = record.get("analysis") or {} if wrapped else {}
@@ -107,6 +135,9 @@ def display_row(record: dict, wrapped: bool) -> dict:
     handling = text(record.get("handlingStatus")) if wrapped else ""
     if wrapped and not handling:
         handling = "resolved" if record.get("resolved") else "pending"
+    ai_result = text(analysis.get("summary"))
+    if not ai_result and text(record.get("aiError")):
+        ai_result = "分析失败：" + text(record.get("aiError"))
     return {
         "job_uuid": text(job.get("jobUuid")),
         "trigger_time": text(job.get("triggerTime")),
@@ -115,6 +146,7 @@ def display_row(record: dict, wrapped: bool) -> dict:
         "status": text(job.get("statusCn") or job.get("status")),
         "consecutive": text(job.get("consecutiveErrorCount")),
         "ai_state": ai_state,
+        "ai_result": ai_result or ai_state,
         "summary": text(analysis.get("summary") or job.get("remark") or job.get("message")),
         "resolved": bool(record.get("resolved")) if wrapped else False,
         "handling": handling,
@@ -287,6 +319,11 @@ class MainWindow(QMainWindow):
         self.column_filters: dict[int, str] = {}
         self.settings: dict = {}
         self.next_due: datetime | None = None
+        self.last_scan_at: datetime | None = None
+        self.scan_in_progress = False
+        self.refresh_in_progress = False
+        self.restore_job_uuid = ""
+        self.restore_scroll_value: int | None = None
         self.workers: set[tuple[QThread, CliWorker, CommandHandler]] = set()
         self.busy_count = 0
         self.exit_timer = QTimer(self)
@@ -296,7 +333,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._bind()
         self.scheduler = QTimer(self)
-        self.scheduler.setInterval(30_000)
+        self.scheduler.setInterval(1_000)
         self.scheduler.timeout.connect(self.on_schedule_tick)
         self.scheduler.start()
         self.run_cli(["settings-get"], self.settings_loaded, "读取设置")
@@ -364,8 +401,11 @@ class MainWindow(QMainWindow):
         heading.addStretch()
         self.next_run = QLabel("下次巡检  --")
         self.next_run.setStyleSheet("color:#2563eb;font-weight:600;padding:8px 12px;background:#e8f0ff;border-radius:8px")
+        self.last_run = QLabel("上次巡检  --")
+        self.last_run.setStyleSheet("color:#475569;font-weight:600;padding:8px 12px;background:#eef2f7;border-radius:8px")
         self.scan_button = QPushButton("立即巡检")
         self.scan_button.setObjectName("Primary")
+        heading.addWidget(self.last_run)
         heading.addWidget(self.next_run)
         heading.addWidget(self.scan_button)
         layout.addLayout(heading)
@@ -422,6 +462,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
         self.table.setColumnWidth(7, 150)
@@ -628,7 +669,6 @@ class MainWindow(QMainWindow):
 
     def run_cli(self, arguments: list[str], on_success, label: str, on_error=None):
         self.busy_count += 1
-        self.side_status.setText(f"● {label}中…")
         thread = QThread(self)
         worker = CliWorker(arguments)
         worker.moveToThread(thread)
@@ -685,6 +725,7 @@ class MainWindow(QMainWindow):
             action.setChecked(self.headers[index] not in hidden)
         self.reset_next_due()
         self.update_side_status()
+        self.load_monitor_status()
         self.refresh_records()
 
     def update_side_status(self):
@@ -697,40 +738,66 @@ class MainWindow(QMainWindow):
             self.next_due = None
             self.next_run.setText("下次巡检  已暂停")
             return
-        now = datetime.now()
-        try:
-            start_h, start_m = map(int, self.settings.get("start_time", "08:00").split(":"))
-            end_h, end_m = map(int, self.settings.get("end_time", "17:30").split(":"))
-            start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-            end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-            frequency = max(1, int(self.settings.get("frequency_minutes", 10)))
-            if now < start:
-                due = start
-            elif now > end:
-                due = start + timedelta(days=1)
-            else:
-                steps = int((now - start).total_seconds() // 60 // frequency) + 1
-                due = start + timedelta(minutes=steps * frequency)
-                if due > end:
-                    due = start + timedelta(days=1)
-            self.next_due = due
-            self.next_run.setText("下次巡检  " + due.strftime("%m-%d %H:%M"))
-        except Exception:
-            self.next_due = None
-            self.next_run.setText("下次巡检  设置无效")
+        self.next_due = calculate_next_due(datetime.now(), self.settings)
+        self.update_schedule_labels()
 
-    def refresh_records(self):
+    def update_schedule_labels(self):
+        if self.settings.get("paused"):
+            self.next_run.setText("下次巡检  已暂停")
+        elif self.scan_in_progress:
+            self.next_run.setText("下次巡检  当前巡检进行中…")
+        elif not self.next_due:
+            self.next_run.setText("下次巡检  设置无效")
+        else:
+            seconds = max(0, int((self.next_due - datetime.now()).total_seconds()))
+            if seconds <= 0:
+                remaining = "即将开始"
+            elif seconds < 3600:
+                remaining = f"{seconds // 60:02d}:{seconds % 60:02d}"
+            else:
+                remaining = f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+            self.next_run.setText(f"下次巡检  {self.next_due:%m-%d %H:%M} · {remaining}")
+        self.last_run.setText("上次巡检  " + (self.last_scan_at.strftime("%m-%d %H:%M:%S") if self.last_scan_at else "暂无记录"))
+
+    def load_monitor_status(self):
+        self.run_cli(["status"], self.monitor_status_loaded, "读取巡检状态", lambda _: None)
+
+    def monitor_status_loaded(self, payload: dict):
+        self.last_scan_at = parse_local_time(payload.get("state", {}).get("lastScanAt", ""))
+        self.update_schedule_labels()
+
+    def refresh_records(self, preserve_job_uuid: str = ""):
+        if self.refresh_in_progress:
+            if preserve_job_uuid:
+                self.restore_job_uuid = preserve_job_uuid
+            return
+        current = self.selected_row()
+        self.restore_job_uuid = preserve_job_uuid or (current.get("job_uuid", "") if current else "")
+        self.restore_scroll_value = self.table.verticalScrollBar().value()
+        self.refresh_in_progress = True
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("刷新中…")
+        self.subtitle.setText("正在刷新数据…")
         self.run_cli(["data", "--view", self.current_view], self.records_loaded, "刷新数据", self.data_error)
 
     def data_error(self, message: str):
+        self.finish_refresh()
         self.subtitle.setText("读取失败：" + message)
 
     def records_loaded(self, records):
-        wrapped = self.current_view != "all"
-        self.rows = [display_row(row, wrapped) for row in records]
-        self.render_rows()
+        try:
+            wrapped = self.current_view != "all"
+            self.rows = [display_row(row, wrapped) for row in records]
+            self.render_rows()
+        finally:
+            self.finish_refresh()
         self.subtitle.setText(f"已读取 {len(self.rows)} 条记录 · 窗口关闭后仍在后台巡检")
         self.update_cards()
+
+    def finish_refresh(self):
+        self.refresh_in_progress = False
+        self.refresh_button.setEnabled(True)
+        self.refresh_button.setText("刷新")
 
     def render_rows(self):
         if not hasattr(self, "table"):
@@ -743,12 +810,15 @@ class MainWindow(QMainWindow):
         ]
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        values = ("trigger_time", "task_name", "robot", "status", "consecutive", "ai_state", "summary")
+        selected_job_uuid = self.restore_job_uuid
+        scroll_value = self.restore_scroll_value
+        values = ("trigger_time", "task_name", "robot", "status", "consecutive", "ai_result", "summary")
         for row in filtered:
             index = self.table.rowCount()
             self.table.insertRow(index)
             for column, key in enumerate(values):
                 item = QTableWidgetItem(text(row[key]))
+                item.setToolTip(text(row[key]) or "未记录")
                 if column == 0:
                     item.setData(Qt.UserRole, row)
                 if row["handling"] in ("resolved", "ignored"):
@@ -759,13 +829,20 @@ class MainWindow(QMainWindow):
                     item.setFont(QFont(item.font().family(), item.font().pointSize(), QFont.DemiBold))
                 self.table.setItem(index, column, item)
             handling_item = QTableWidgetItem(self._handling_label(row["handling"]))
+            handling_item.setToolTip(self._handling_label(row["handling"]))
             self.table.setItem(index, 7, handling_item)
             if row["wrapped"]:
                 self.table.setCellWidget(index, 7, self._handling_buttons(row))
         self.total_value.setText(str(len(filtered)))
-        self.detail_meta.setText("选择一条记录查看详情")
-        self.detail_text.clear()
-        self.set_screenshot("")
+        restored = self.select_job(selected_job_uuid) if selected_job_uuid else False
+        if scroll_value is not None:
+            QTimer.singleShot(0, lambda value=scroll_value: self.table.verticalScrollBar().setValue(value))
+        self.restore_job_uuid = ""
+        self.restore_scroll_value = None
+        if not restored:
+            self.detail_meta.setText("选择一条记录查看详情")
+            self.detail_text.clear()
+            self.set_screenshot("")
 
     def _handling_label(self, value: str) -> str:
         return {"resolved": "已解决", "ignored": "无需处理", "pending": "待处理", "": "—"}.get(value, value)
@@ -773,7 +850,7 @@ class MainWindow(QMainWindow):
     def _column_value(self, row: dict, column: int) -> str:
         if column == 0:
             return row["trigger_time"][:10] or "未记录"
-        keys = {1: "task_name", 2: "robot", 3: "status", 4: "consecutive", 5: "ai_state", 6: "summary"}
+        keys = {1: "task_name", 2: "robot", 3: "status", 4: "consecutive", 5: "ai_result", 6: "summary"}
         if column == 7:
             return self._handling_label(row["handling"])
         return text(row.get(keys.get(column, ""))) or "未记录"
@@ -790,6 +867,7 @@ class MainWindow(QMainWindow):
         for button in (resolved, ignored):
             button.setCheckable(True)
             button.setFixedHeight(28)
+            button.setToolTip(button.text())
         resolved.setChecked(row["handling"] == "resolved")
         ignored.setChecked(row["handling"] == "ignored")
         resolved.clicked.connect(
@@ -841,6 +919,18 @@ class MainWindow(QMainWindow):
             return None
         return self.table.item(index, 0).data(Qt.UserRole)
 
+    def select_job(self, job_uuid: str) -> bool:
+        if not job_uuid:
+            return False
+        for index in range(self.table.rowCount()):
+            item = self.table.item(index, 0)
+            row = item.data(Qt.UserRole) if item else None
+            if row and row.get("job_uuid") == job_uuid:
+                self.table.selectRow(index)
+                self.show_selected()
+                return True
+        return False
+
     def show_selected(self):
         row = self.selected_row()
         if not row:
@@ -869,9 +959,14 @@ class MainWindow(QMainWindow):
 
     def manual_scan(self):
         self.scan_button.setEnabled(False)
+        self.scan_in_progress = True
+        self.update_schedule_labels()
 
         def complete(result):
             self.scan_button.setEnabled(True)
+            self.scan_in_progress = False
+            self.last_scan_at = parse_local_time(result.get("updatedAt", "")) or datetime.now()
+            self.update_schedule_labels()
             self.subtitle.setText(f"巡检完成：读取 {result.get('fetched', 0)} 条，需关注 {result.get('attention', 0)} 条")
             self.refresh_records()
             self.reset_next_due()
@@ -880,6 +975,8 @@ class MainWindow(QMainWindow):
 
     def scan_failed(self, message: str):
         self.scan_button.setEnabled(True)
+        self.scan_in_progress = False
+        self.update_schedule_labels()
         QMessageBox.critical(self, "巡检失败", message)
 
     def analyze_selected(self):
@@ -908,7 +1005,12 @@ class MainWindow(QMainWindow):
         self.run_cli(["retry", "--job", row["job_uuid"]], complete, "手动重试")
 
     def set_handling_status(self, job_uuid: str, value: str):
-        self.run_cli(["handle", "--job", job_uuid, "--value", value], lambda _: self.refresh_records(), "更新处理方式")
+        self.select_job(job_uuid)
+        self.run_cli(
+            ["handle", "--job", job_uuid, "--value", value],
+            lambda _: self.refresh_records(job_uuid),
+            "更新处理方式",
+        )
 
     def cell_double_clicked(self, row_index: int, column: int):
         if column != 1:
@@ -1052,10 +1154,16 @@ class MainWindow(QMainWindow):
         self.run_cli(["settings-save", payload], complete, "更新巡检状态")
 
     def on_schedule_tick(self):
+        self.update_schedule_labels()
         if self.busy_count or self.settings.get("paused") or not self.next_due or datetime.now() < self.next_due:
             return
+        self.scan_in_progress = True
+        self.update_schedule_labels()
 
         def complete(result):
+            self.scan_in_progress = False
+            if not result.get("skipped"):
+                self.last_scan_at = parse_local_time(result.get("updatedAt", "")) or datetime.now()
             notifications = result.get("notifications") or []
             if notifications:
                 self.tray.showMessage("RPA 异常更新", text(notifications[0].get("message")), QSystemTrayIcon.Warning, 5000)
@@ -1065,6 +1173,7 @@ class MainWindow(QMainWindow):
         self.run_cli(["scan"], complete, "后台巡检", lambda message: self.background_scan_error(message))
 
     def background_scan_error(self, message: str):
+        self.scan_in_progress = False
         self.subtitle.setText("巡检失败：" + message)
         self.reset_next_due()
 
